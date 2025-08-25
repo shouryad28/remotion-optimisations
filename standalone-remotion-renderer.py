@@ -204,6 +204,58 @@ if MODAL_AVAILABLE:
                 
                 print("✅ Dependencies installed")
                 
+                # Bundle once and reuse for all shards (anti-pattern to bundle every time)
+                print("📦 Bundling project once for reuse across shards...")
+                bundle_dir = actual_project_dir / "dist"
+                bundle_result = subprocess.run(
+                    ["npx", "remotion", "bundle", "src/index.ts", str(bundle_dir)],
+                    cwd=actual_project_dir,
+                    capture_output=True,
+                    text=True,
+                    timeout=300
+                )
+                
+                if bundle_result.returncode != 0:
+                    print(f"⚠️ Bundling failed: {bundle_result.stderr}")
+                    # Fallback to direct source
+                    serve_url = "src/index.ts"
+                    print("🔄 Falling back to direct source rendering")
+                else:
+                    serve_url = str(bundle_dir)
+                    print(f"✅ Project bundled successfully at {serve_url}")
+                
+                # Get total frames for composition
+                print("🔍 Getting composition metadata...")
+                compositions_result = subprocess.run(
+                    ["npx", "remotion", "compositions", "--serve-url", serve_url, "--json"],
+                    cwd=actual_project_dir,
+                    capture_output=True,
+                    text=True,
+                    timeout=60
+                )
+                
+                total_frames = None
+                composition_fps = 30  # Default fallback
+                
+                if compositions_result.returncode == 0:
+                    try:
+                        import json
+                        compositions_data = json.loads(compositions_result.stdout)
+                        comp_info = next((c for c in compositions_data["compositions"] if c["id"] == first_composition), None)
+                        if comp_info:
+                            total_frames = comp_info["durationInFrames"]
+                            composition_fps = comp_info["fps"]
+                            print(f"📊 Composition: {total_frames} frames at {composition_fps} FPS")
+                        else:
+                            print("⚠️ Could not find composition info")
+                            total_frames = 1000  # Fallback estimate
+                    except Exception as e:
+                        print(f"⚠️ Could not parse composition metadata: {e}")
+                        total_frames = 1000  # Fallback estimate
+                else:
+                    print(f"⚠️ Failed to get composition metadata: {compositions_result.stderr}")
+                    total_frames = 1000  # Fallback estimate
+                
                 # Discover compositions
                 # print("🔍 Discovering compositions...")
                 # compositions_result = subprocess.run(
@@ -232,26 +284,110 @@ if MODAL_AVAILABLE:
 
                 start_time = datetime.now()
                 
-                # Render the composition as image sequence
-                print("🎬 Rendering image sequence...")
-                render_result = subprocess.run(
-                    ["npx", "remotion", "render", first_composition, str(frames_dir),
-                    "--sequence",
-                    "--image-format=png",
-                    "--concurrency=4",
-                    "--chrome-mode=chrome-for-testing",
-                    "--gl=angle-egl",
-                    "--log=error"],
-                    cwd=actual_project_dir,
-                    capture_output=True,
-                    text=True,
-                    timeout=2400
-                )
+                # Implement 4-shard parallel rendering
+                num_shards = 4
+                print(f"🧩 Implementing {num_shards}-shard parallel rendering...")
                 
-                if render_result.returncode != 0:
-                    raise Exception(f"Render failed: {render_result.stderr}")
+                # Calculate frame ranges for each shard (split 0..(total_frames-1) evenly)
+                frames_per_shard = total_frames // num_shards
+                remainder_frames = total_frames % num_shards
                 
-                print("✅ Render completed successfully")
+                shard_ranges = []
+                current_frame = 0
+                for i in range(num_shards):
+                    # Add extra frame to first few shards if there's a remainder
+                    shard_frames = frames_per_shard + (1 if i < remainder_frames else 0)
+                    end_frame = current_frame + shard_frames - 1
+                    shard_ranges.append((current_frame, end_frame))
+                    current_frame += shard_frames
+                
+                print(f"📊 Frame distribution across {num_shards} shards:")
+                for i, (start, end) in enumerate(shard_ranges):
+                    print(f"   Shard {i}: frames {start}-{end} ({end - start + 1} frames)")
+                
+                # Create shard output directories
+                shard_dirs = []
+                for i in range(num_shards):
+                    shard_dir = output_dir / f"shard_{i}"
+                    shard_dir.mkdir(exist_ok=True)
+                    shard_dirs.append(shard_dir)
+                
+                # Calculate concurrency per shard (sum across shards ≈ CPU cores)
+                total_cpu_cores = 4
+                concurrency_per_shard = max(1, total_cpu_cores // num_shards)
+                print(f"🔧 Using concurrency {concurrency_per_shard} per shard (total: {concurrency_per_shard * num_shards})")
+                
+                # Run shards in parallel
+                import concurrent.futures
+                
+                def render_shard(shard_info):
+                    shard_idx, start_frame, end_frame, shard_dir = shard_info
+                    print(f"🚀 Starting shard {shard_idx}: frames {start_frame}-{end_frame}")
+                    
+                    shard_cmd = [
+                        "npx", "remotion", "render",
+                        "--serve-url", serve_url,  # Use pre-bundled version
+                        first_composition, str(shard_dir),
+                        "--sequence",
+                        "--image-format=jpeg",
+                        f"--frames={start_frame}-{end_frame}",  # Frame range for this shard
+                        f"--concurrency={concurrency_per_shard}",
+                        "--chrome-mode=chrome-for-testing",
+                        "--gl=angle-egl",
+                        "--enable-multiprocess-on-linux",  # Better throughput on Linux
+                        "--log=warn"  # Reduce log noise
+                    ]
+                    
+                    result = subprocess.run(
+                        shard_cmd,
+                        cwd=actual_project_dir,
+                        capture_output=True,
+                        text=True,
+                        timeout=1800  # 30 min timeout per shard
+                    )
+                    
+                    if result.returncode == 0:
+                        print(f"✅ Shard {shard_idx} completed successfully")
+                        return True, shard_idx, None
+                    else:
+                        print(f"❌ Shard {shard_idx} failed: {result.stderr}")
+                        return False, shard_idx, result.stderr
+                
+                # Prepare shard tasks
+                shard_tasks = []
+                for i, (start_frame, end_frame) in enumerate(shard_ranges):
+                    shard_tasks.append((i, start_frame, end_frame, shard_dirs[i]))
+                
+                # Execute all shards in parallel
+                print(f"🎬 Launching {num_shards} parallel render processes...")
+                with concurrent.futures.ThreadPoolExecutor(max_workers=num_shards) as executor:
+                    futures = [executor.submit(render_shard, task) for task in shard_tasks]
+                    results = [future.result() for future in concurrent.futures.as_completed(futures)]
+                
+                # Check for failures
+                failed_shards = [r for r in results if not r[0]]
+                if failed_shards:
+                    error_msgs = [f"Shard {r[1]}: {r[2]}" for r in failed_shards]
+                    raise Exception(f"Shard rendering failed: {'; '.join(error_msgs)}")
+                
+                # Merge all shards into final sequence
+                print("🔗 Merging shards into final frame sequence...")
+                frame_counter = 0
+                for i, shard_dir in enumerate(shard_dirs):
+                    shard_frames = sorted(shard_dir.glob("*.jpeg"))
+                    print(f"   Merging {len(shard_frames)} frames from shard {i}")
+                    
+                    for frame_file in shard_frames:
+                        # Rename to sequential numbering
+                        new_name = f"frame_{frame_counter:05d}.jpeg"
+                        target_path = frames_dir / new_name
+                        frame_file.rename(target_path)
+                        frame_counter += 1
+                    
+                    # Clean up shard directory
+                    shard_dir.rmdir()
+                
+                print(f"✅ Merged {frame_counter} frames from {num_shards} shards")
 
                 render_time = datetime.now() - start_time
                 # Check NVENC support in FFmpeg
@@ -280,7 +416,7 @@ if MODAL_AVAILABLE:
                         "-y",
                         "-framerate", "30",
                         "-pattern_type", "glob",
-                        "-i", str(frames_dir / "*.png"),
+                        "-i", str(frames_dir / "*.jpeg"),
                         "-vf", "scale=1920:1080,format=yuv420p",
                         "-c:v", "h264_nvenc",
                         "-preset", "p4",
@@ -298,7 +434,7 @@ if MODAL_AVAILABLE:
                         "ffmpeg",
                         "-framerate",
                         "30",
-                        "-i", str(frames_dir / "frame_%04d.png"),
+                        "-i", str(frames_dir / "frame_%04d.jpeg"),
                         "-c:v", "libx264",
                         "-pix_fmt", "yuv420p",
                         "-crf", "18",
