@@ -1,0 +1,9 @@
+env.txt
+.env
+.vscode/
+remotion-outputs/*
+!remotion-outputs/package.json
+test_*
+__pycache__/
+test.ipynb
+.DS_Store
