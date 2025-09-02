@@ -81,11 +81,84 @@ if MODAL_AVAILABLE:
     
     app = modal.App("standalone-remotion-renderer-images")
     
+    def _get_remotion_meta(
+        actual_project_dir: Path, 
+        composition_id: str
+    ) -> dict:
+        """Get composition metadata (fps, durationInFrames) via Node script"""
+        node_script = """
+        import {bundle} from '@remotion/bundler';
+        import {getCompositions} from '@remotion/renderer';
+
+        const [entry, compId] = process.argv.slice(2);
+        
+        const run = async () => {
+        const bundleLocation = await bundle({
+            entryPoint: entry,
+            // Set browser executable path for bundling
+            overrideWebpackConfig: (config) => {
+                return config;
+            }
+        });
+        
+        const comps = await getCompositions(bundleLocation, {
+            // Set browser executable path for Chrome
+            // chromiumOptions: {
+            //     executablePath: '/opt/google/chrome/google-chrome'
+            // }
+        });
+        
+        const comp = comps.find(c => c.id === compId) ?? comps[0];
+        if (!comp) {
+            console.error('No composition found');
+            process.exit(1);
+        }
+        console.log(JSON.stringify({fps: comp.fps, durationInFrames: comp.durationInFrames, id: comp.id}));
+        };
+        run();
+        """.strip()
+
+        import json
+        # Create the script inside the project directory so it can access node_modules
+        meta_js = actual_project_dir / "temp_meta.mjs"
+        try:
+            print('Writing temp_meta.mjs')
+            meta_js.write_text(node_script)
+            res = subprocess.run(
+                ["node", str(meta_js), "src/index.ts", composition_id],
+                cwd=actual_project_dir,
+                capture_output=True,
+                text=True,
+                timeout=600,
+            )
+            
+            if res.returncode != 0:
+                raise RuntimeError(f"Failed to get composition meta: {res.stderr}")
+            print("Done getting composition meta")
+            print('res is', res)
+
+            out_lines = [l.strip() for l in res.stdout.splitlines() if l.strip()]
+            # json_line = next((l for l in reversed(out_lines) if l.startswith("{")), None)
+            for line in out_lines:
+                print('line', line)
+                if line.startswith("{"):
+                    json_line = line
+                    # break
+            if not json_line:
+                raise RuntimeError("Could not find JSON in getCompositions output")
+            meta = json.loads(json_line)
+
+            return meta
+        finally:
+            # Clean up the temporary script file
+            if meta_js.exists():
+                meta_js.unlink()
+
     @app.function(
         image=remotion_image,
         timeout=2400,
-        memory=8192,
-        cpu=4,
+        memory=16384,
+        cpu=8,
         gpu="T4",
         secrets=[modal.Secret.from_name("aws-secret")]
     )
@@ -161,31 +234,6 @@ if MODAL_AVAILABLE:
                 
                 print(f"📁 Initial project directory: {actual_project_dir}")
                 
-                # For Motion Canvas projects, might need to parse vite.config.ts
-                vite_config_path = actual_project_dir / "vite.config.ts"
-                if vite_config_path.exists() and "motionCanvas" in vite_config_path.read_text():
-                    print("📝 Found Motion Canvas vite.config.ts, parsing for project location...")
-                    vite_content = vite_config_path.read_text(encoding='utf-8')
-                    
-                    # Look for project paths in motionCanvas plugin configuration
-                    import re
-                    project_pattern = r'project:\s*\[[\s\n]*[\'"`]([^\'"`]+)[\'"`]'
-                    matches = re.findall(project_pattern, vite_content, re.DOTALL)
-                    
-                    if matches:
-                        relative_project_path = matches[0]
-                        if relative_project_path.startswith('./'):
-                            relative_project_path = relative_project_path[2:]
-                        
-                        # This is typically pointing to a project.ts file
-                        project_ts_path = actual_project_dir / relative_project_path
-                        if project_ts_path.exists():
-                            print(f"✅ Found project.ts via vite config: {project_ts_path}")
-                            # For Motion Canvas, we still run from the root with package.json
-                            # but now we know where the project.ts is
-                
-                print(f"📁 Using project directory: {actual_project_dir}")
-                
                 # Install dependencies
                 print("📦 Installing npm dependencies...")
                 install_result = subprocess.run(
@@ -224,37 +272,45 @@ if MODAL_AVAILABLE:
                     serve_url = str(bundle_dir)
                     print(f"✅ Project bundled successfully at {serve_url}")
                 
-                # Get total frames for composition
-                print("🔍 Getting composition metadata...")
-                compositions_result = subprocess.run(
-                    ["npx", "remotion", "compositions", "--serve-url", serve_url, "--json"],
-                    cwd=actual_project_dir,
-                    capture_output=True,
-                    text=True,
-                    timeout=60
-                )
+                first_composition = 'FullVideo'
+                print(f"🎯 Using composition: {first_composition}")
                 
-                total_frames = None
-                composition_fps = 30  # Default fallback
+                metadata = _get_remotion_meta(actual_project_dir, first_composition)
+                total_frames = metadata['durationInFrames']
+                composition_fps = metadata['fps']
+                print(f"📊 Composition: {total_frames} frames at {composition_fps} FPS")
                 
-                if compositions_result.returncode == 0:
-                    try:
-                        import json
-                        compositions_data = json.loads(compositions_result.stdout)
-                        comp_info = next((c for c in compositions_data["compositions"] if c["id"] == first_composition), None)
-                        if comp_info:
-                            total_frames = comp_info["durationInFrames"]
-                            composition_fps = comp_info["fps"]
-                            print(f"📊 Composition: {total_frames} frames at {composition_fps} FPS")
-                        else:
-                            print("⚠️ Could not find composition info")
-                            total_frames = 1000  # Fallback estimate
-                    except Exception as e:
-                        print(f"⚠️ Could not parse composition metadata: {e}")
-                        total_frames = 1000  # Fallback estimate
-                else:
-                    print(f"⚠️ Failed to get composition metadata: {compositions_result.stderr}")
-                    total_frames = 1000  # Fallback estimate
+                # # Get total frames for composition
+                # print("🔍 Getting composition metadata...")
+                # compositions_result = subprocess.run(
+                #     ["npx", "remotion", "compositions", "--serve-url", serve_url, "--json"],
+                #     cwd=actual_project_dir,
+                #     capture_output=True,
+                #     text=True,
+                #     timeout=60
+                # )
+                
+                # total_frames = None
+                # composition_fps = 30  # Default fallback
+                
+                # if compositions_result.returncode == 0:
+                #     try:
+                #         import json
+                #         compositions_data = json.loads(compositions_result.stdout)
+                #         comp_info = next((c for c in compositions_data["compositions"] if c["id"] == first_composition), None)
+                #         if comp_info:
+                #             total_frames = comp_info["durationInFrames"]
+                #             composition_fps = comp_info["fps"]
+                #             print(f"📊 Composition: {total_frames} frames at {composition_fps} FPS")
+                #         else:
+                #             print("⚠️ Could not find composition info")
+                #             total_frames = 1000  # Fallback estimate
+                #     except Exception as e:
+                #         print(f"⚠️ Could not parse composition metadata: {e}")
+                #         total_frames = 1000  # Fallback estimate
+                # else:
+                #     print(f"⚠️ Failed to get composition metadata: {compositions_result.stderr}")
+                #     total_frames = 1000  # Fallback estimate
                 
                 # Discover compositions
                 # print("🔍 Discovering compositions...")
@@ -273,8 +329,6 @@ if MODAL_AVAILABLE:
                 # compositions_output = compositions_result.stdout.strip()
                 # print(f"Raw compositions output:\n{compositions_output}")
                 
-                first_composition = 'FullVideo'
-                print(f"🎯 Using composition: {first_composition}")
                 
                 # Create output directory
                 output_dir = actual_project_dir / "out"
@@ -285,7 +339,7 @@ if MODAL_AVAILABLE:
                 start_time = datetime.now()
                 
                 # Implement 4-shard parallel rendering
-                num_shards = 4
+                num_shards = 6
                 print(f"🧩 Implementing {num_shards}-shard parallel rendering...")
                 
                 # Calculate frame ranges for each shard (split 0..(total_frames-1) evenly)
